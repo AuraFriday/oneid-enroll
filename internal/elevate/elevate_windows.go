@@ -44,17 +44,37 @@ func relaunchElevatedWindows(executablePath string, args []string) error {
 	shell32 := windows.NewLazySystemDLL("shell32.dll")
 	shellExecuteExW := shell32.NewProc("ShellExecuteExW")
 
-	// Create a temp file for the elevated process to write its JSON output
-	tempFile, err := os.CreateTemp("", "oneid-elevated-*.json")
-	if err != nil {
-		return fmt.Errorf("could not create temp file for elevated output: %v", err)
+	// Check if this is a session command (uses --pipe for I/O instead of --output-file).
+	// Session mode communicates over a TCP socket, not a temp file.
+	// Also check for --session-token which accompanies --pipe.
+	isSessionWithPipe := false
+	for _, arg := range args {
+		if arg == "--pipe" || arg == "--session-token" {
+			isSessionWithPipe = true
+			break
+		}
 	}
-	outputFilePath := tempFile.Name()
-	tempFile.Close()
-	defer os.Remove(outputFilePath)
 
-	// Add --output-file to the args so the child writes JSON there
-	elevatedArgs := append(args, "--output-file", outputFilePath)
+	var outputFilePath string
+	var elevatedArgs []string
+
+	if isSessionWithPipe {
+		// Session mode: no output file needed, I/O goes over the TCP socket
+		elevatedArgs = args
+	} else {
+		// Normal mode: use a temp file for the elevated process to write its JSON output
+		tempFile, err := os.CreateTemp("", "oneid-elevated-*.json")
+		if err != nil {
+			return fmt.Errorf("could not create temp file for elevated output: %v", err)
+		}
+		outputFilePath = tempFile.Name()
+		tempFile.Close()
+		defer os.Remove(outputFilePath)
+
+		// Add --output-file to the args so the child writes JSON there
+		elevatedArgs = append(args, "--output-file", outputFilePath)
+	}
+
 	argsStr := strings.Join(elevatedArgs, " ")
 
 	type SHELLEXECUTEINFO struct {
@@ -107,10 +127,12 @@ func relaunchElevatedWindows(executablePath string, args []string) error {
 		windows.CloseHandle(handle)
 	}
 
-	// Read the output file and print it to our stdout
-	outputData, readErr := os.ReadFile(outputFilePath)
-	if readErr == nil && len(outputData) > 0 {
-		os.Stdout.Write(outputData)
+	// Read the output file and print it to our stdout (not used in session mode)
+	if outputFilePath != "" {
+		outputData, readErr := os.ReadFile(outputFilePath)
+		if readErr == nil && len(outputData) > 0 {
+			os.Stdout.Write(outputData)
+		}
 	}
 
 	os.Exit(int(exitCode))

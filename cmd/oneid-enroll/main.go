@@ -12,7 +12,7 @@
 //
 //	oneid-enroll detect [--json]
 //	oneid-enroll extract [--json] [--elevated] [--type tpm]
-//	oneid-enroll activate [--json] [--elevated] --challenge <base64>
+//	oneid-enroll activate [--json] [--elevated] --credential-blob <b64> --encrypted-secret <b64> --ak-handle <hex>
 //	oneid-enroll version [--json]
 //
 // The --json flag makes output machine-parseable (default for SDK use).
@@ -20,15 +20,20 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/AuraFriday/oneid-enroll/internal/elevate"
 	"github.com/AuraFriday/oneid-enroll/internal/piv"
 	"github.com/AuraFriday/oneid-enroll/internal/protocol"
+	"github.com/AuraFriday/oneid-enroll/internal/session"
 	"github.com/AuraFriday/oneid-enroll/internal/tpm"
 	"github.com/google/go-tpm/tpm2/transport"
 )
@@ -118,6 +123,10 @@ func main() {
 		runExtract(subArgs)
 	case "activate":
 		runActivate(subArgs)
+	case "sign":
+		runSign(subArgs)
+	case "session":
+		runSession(subArgs)
 	case "version":
 		runVersion(subArgs)
 	case "help", "--help", "-h":
@@ -133,15 +142,23 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `oneid-enroll -- HSM helper for 1id.com identity SDK
 
 Usage:
-  oneid-enroll detect    [--json]                      Detect available HSMs
-  oneid-enroll extract   [--json] [--elevated]         Extract EK cert + generate AK
-  oneid-enroll activate  [--json] [--elevated] --challenge <b64>  Decrypt credential challenge
-  oneid-enroll version   [--json]                      Print version
-  oneid-enroll help                                    Print this help
+  oneid-enroll detect    [--json]                          Detect available HSMs
+  oneid-enroll extract   [--json] [--elevated]             Extract EK cert + generate AK
+  oneid-enroll activate  [--json] [--elevated]             Decrypt credential challenge
+                         --credential-blob <b64>
+                         --encrypted-secret <b64>
+                         --ak-handle <hex>
+  oneid-enroll sign      [--json]                          Sign a challenge nonce (NO elevation)
+                         --nonce <b64>
+                         --ak-handle <hex>
+  oneid-enroll session   [--elevated] [--pipe <name>]      Interactive session (one UAC)
+  oneid-enroll version   [--json]                          Print version
+  oneid-enroll help                                        Print this help
 
 Flags:
   --json       Output JSON to stdout (for SDK consumption)
-  --elevated   Trigger UAC/sudo if not already running as admin`)
+  --elevated   Trigger UAC/sudo if not already running as admin
+  --pipe       Named pipe for session I/O (Windows; Linux/macOS uses stdin/stdout)`)
 }
 
 // runDetect scans for available HSMs (no elevation required).
@@ -267,7 +284,30 @@ func runExtract(args []string) {
 	}
 }
 
-// runExtractTPM reads EK cert and (optionally) generates AK from a TPM.
+// ExtractAndGenerateAKResult combines EK data and AK data for the SDK.
+// This is the full attestation data the server needs for enrollment.
+type ExtractAndGenerateAKResult struct {
+	// EK fields (from tpm.EKData)
+	EKCertificatePEM   string   `json:"ek_cert_pem"`
+	EKPublicKeyPEM     string   `json:"ek_public_pem"`
+	EKCertificateChain []string `json:"chain_pem"`
+	EKFingerprint      string   `json:"ek_fingerprint"`
+	EKSubjectCN        string   `json:"subject_cn"`
+	EKIssuerCN         string   `json:"issuer_cn"`
+	EKNotBefore        string   `json:"not_before"`
+	EKNotAfter         string   `json:"not_after"`
+	// AK fields (from tpm.AKData)
+	AKPublicKeyPEM     string `json:"ak_public_pem"`
+	AKHandle           string `json:"ak_handle"`
+	AKAlgorithm        string `json:"ak_algorithm"`
+	AKTPMTPublicBase64 string `json:"ak_tpmt_public_b64"` // Base64-encoded marshaled TPMT_PUBLIC
+	AKTPMName          string `json:"ak_tpm_name"`         // Hex-encoded TPM Name
+}
+
+// runExtractTPM reads EK cert and generates an AK from a TPM.
+// Both pieces of data are needed for the enrollment flow:
+//   - EK cert: sent to server for chain validation and MakeCredential
+//   - AK public + TPM Name: server uses TPM Name in MakeCredential
 func runExtractTPM(jsonOutput bool) {
 	// Open TPM
 	tpmDevice, err := transport.OpenTPM()
@@ -282,7 +322,7 @@ func runExtractTPM(jsonOutput bool) {
 	}
 	defer tpmDevice.Close()
 
-	// Extract EK certificate from NV storage
+	// Step 1: Extract EK certificate from NV storage
 	ekData, err := tpm.ExtractEKCertificate(tpmDevice)
 	if err != nil {
 		if jsonOutput {
@@ -294,23 +334,70 @@ func runExtractTPM(jsonOutput bool) {
 		return
 	}
 
+	// Step 2: Get or generate an AK (Attestation Identity Key).
+	// If a persistent AK already exists in our handle range, reuse it.
+	// Otherwise, create a new one and persist it.
+	// The AK is bound to the EK via credential activation -- this binding
+	// proves the AK lives inside the same TPM as the EK.
+	akData, err := tpm.GetOrCreateAK(tpmDevice)
+	if err != nil {
+		if jsonOutput {
+			protocol.ErrorResponse("HSM_ACCESS_ERROR", fmt.Sprintf("Could not generate AK: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Could not generate AK: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if jsonOutput {
-		protocol.SuccessResponse(ekData)
+		// Combine EK and AK data into a single response for the SDK.
+		// The SDK sends all of this to the server's /enroll/begin endpoint.
+		import_b64 := base64.StdEncoding.EncodeToString(akData.TPMTPublicBytes)
+		result := ExtractAndGenerateAKResult{
+			EKCertificatePEM:   ekData.CertificatePEM,
+			EKPublicKeyPEM:     ekData.PublicKeyPEM,
+			EKCertificateChain: ekData.CertificateChain,
+			EKFingerprint:      ekData.Fingerprint,
+			EKSubjectCN:        ekData.SubjectCN,
+			EKIssuerCN:         ekData.IssuerCN,
+			EKNotBefore:        ekData.NotBefore,
+			EKNotAfter:         ekData.NotAfter,
+			AKPublicKeyPEM:     akData.PublicKeyPEM,
+			AKHandle:           akData.Handle,
+			AKAlgorithm:        akData.KeyAlgorithm,
+			AKTPMTPublicBase64: import_b64,
+			AKTPMName:          akData.TPMName,
+		}
+		protocol.SuccessResponse(result)
 	} else {
 		protocol.HumanMessage("EK Certificate extracted successfully")
 		protocol.HumanMessage("  Subject:     %s", ekData.SubjectCN)
 		protocol.HumanMessage("  Issuer:      %s", ekData.IssuerCN)
 		protocol.HumanMessage("  Valid:       %s to %s", ekData.NotBefore, ekData.NotAfter)
 		protocol.HumanMessage("  Fingerprint: %s", ekData.Fingerprint)
+		protocol.HumanMessage("")
+		protocol.HumanMessage("AK generated and persisted")
+		protocol.HumanMessage("  Handle:      %s", akData.Handle)
+		protocol.HumanMessage("  Algorithm:   %s", akData.KeyAlgorithm)
+		protocol.HumanMessage("  TPM Name:    %s", akData.TPMName)
 	}
 }
 
-// runActivate decrypts a credential activation challenge.
+// runActivate decrypts a credential activation challenge using the TPM.
+//
+// This is Phase 2 of enrollment: the server has created a MakeCredential
+// challenge (credential_blob + encrypted_secret), and we need the TPM
+// to call ActivateCredential to decrypt it, proving this AK is in this TPM.
+//
+// REQUIRES ELEVATION: uses the EK via endorsement hierarchy.
 func runActivate(args []string) {
 	flags := flag.NewFlagSet("activate", flag.ExitOnError)
 	jsonOutput := flags.Bool("json", false, "output JSON")
 	wantElevation := flags.Bool("elevated", false, "trigger UAC/sudo")
-	challenge := flags.String("challenge", "", "base64-encoded credential blob")
+	credentialBlobB64 := flags.String("credential-blob", "", "base64-encoded credential blob from server")
+	encryptedSecretB64 := flags.String("encrypted-secret", "", "base64-encoded encrypted secret from server")
+	akHandleStr := flags.String("ak-handle", "", "AK persistent handle (hex, e.g. 0x81000100)")
 	outputFile := flags.String("output-file", "", "write output to file instead of stdout (used by elevation)")
 	alreadyElevated := flags.Bool("_already-elevated", false, "internal: marks process as already elevated")
 	flags.Parse(args)
@@ -334,11 +421,42 @@ func runActivate(args []string) {
 		*wantElevation = false
 	}
 
-	if *challenge == "" {
+	// Validate required arguments
+	if *credentialBlobB64 == "" || *encryptedSecretB64 == "" || *akHandleStr == "" {
+		missingArgs := ""
+		if *credentialBlobB64 == "" { missingArgs += " --credential-blob" }
+		if *encryptedSecretB64 == "" { missingArgs += " --encrypted-secret" }
+		if *akHandleStr == "" { missingArgs += " --ak-handle" }
 		if *jsonOutput {
-			protocol.ErrorResponse("MISSING_ARGUMENT", "--challenge is required")
+			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required arguments:%s", missingArgs))
 		} else {
-			protocol.HumanMessage("Error: --challenge is required")
+			protocol.HumanMessage("Error: required arguments:%s", missingArgs)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Parse AK handle (hex string like "0x81000100")
+	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
+	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, err))
+		} else {
+			protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// SECURITY: Validate AK handle is within our expected range (0x81000100-0x810001FF)
+	// to prevent using arbitrary persistent handles.
+	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+		if *jsonOutput {
+			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
+				"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
+		} else {
+			protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
 			os.Exit(1)
 		}
 		return
@@ -358,11 +476,195 @@ func runActivate(args []string) {
 		return
 	}
 
-	// Credential activation is under development
+	// Open the TPM
+	tpmDevice, err := transport.OpenTPM()
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Could not open TPM: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	defer tpmDevice.Close()
+
+	// Call TPM2_ActivateCredential to decrypt the server's challenge.
+	// This proves our AK is inside the TPM that owns the EK.
+	result, err := tpm.ActivateCredential(
+		tpmDevice,
+		uint32(akHandleVal),
+		*credentialBlobB64,
+		*encryptedSecretB64,
+	)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("ACTIVATE_CREDENTIAL_FAILED", fmt.Sprintf("TPM2_ActivateCredential failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: TPM2_ActivateCredential failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *jsonOutput {
-		protocol.ErrorResponse("NOT_IMPLEMENTED", "Credential activation is under development")
+		protocol.SuccessResponse(result)
 	} else {
-		protocol.HumanMessage("Credential activation is under development.")
+		protocol.HumanMessage("Credential activation successful!")
+		protocol.HumanMessage("  Decrypted credential: %s", result.DecryptedCredential)
+	}
+}
+
+// runSign signs a challenge nonce using the persistent AK.
+//
+// NO ELEVATION REQUIRED. The AK has UserWithAuth=true, so TPM2_Sign
+// works at normal user privilege. This is the core of ongoing TPM-backed
+// authentication -- agents sign server-provided nonces to prove they
+// still control the same hardware.
+func runSign(args []string) {
+	flags := flag.NewFlagSet("sign", flag.ExitOnError)
+	jsonOutput := flags.Bool("json", false, "output JSON")
+	nonceB64 := flags.String("nonce", "", "base64-encoded nonce from server")
+	akHandleStr := flags.String("ak-handle", "", "AK persistent handle (hex, e.g. 0x81000100)")
+	flags.Parse(args)
+
+	// Validate required arguments
+	if *nonceB64 == "" || *akHandleStr == "" {
+		missingArgs := ""
+		if *nonceB64 == "" { missingArgs += " --nonce" }
+		if *akHandleStr == "" { missingArgs += " --ak-handle" }
+		if *jsonOutput {
+			protocol.ErrorResponse("MISSING_ARGUMENT", fmt.Sprintf("Required arguments:%s", missingArgs))
+		} else {
+			protocol.HumanMessage("Error: required arguments:%s", missingArgs)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Parse AK handle
+	akHandleClean := strings.TrimPrefix(strings.TrimPrefix(*akHandleStr, "0x"), "0X")
+	akHandleVal, err := strconv.ParseUint(akHandleClean, 16, 32)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf("Invalid AK handle '%s': %v", *akHandleStr, err))
+		} else {
+			protocol.HumanMessage("Error: invalid AK handle '%s': %v", *akHandleStr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// SECURITY: Validate AK handle is within our expected range
+	if akHandleVal < 0x81000100 || akHandleVal > 0x810001FF {
+		if *jsonOutput {
+			protocol.ErrorResponse("INVALID_ARGUMENT", fmt.Sprintf(
+				"AK handle 0x%08X is outside the allowed range 0x81000100-0x810001FF", akHandleVal))
+		} else {
+			protocol.HumanMessage("Error: AK handle 0x%08X is outside the allowed range", akHandleVal)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Open TPM -- NO elevation needed for TPM2_Sign with UserWithAuth key
+	tpmDevice, err := transport.OpenTPM()
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("NO_HSM_FOUND", fmt.Sprintf("Could not open TPM: %v", err))
+		} else {
+			protocol.HumanMessage("Error: Could not open TPM: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	defer tpmDevice.Close()
+
+	result, err := tpm.SignChallengeWithAK(tpmDevice, uint32(akHandleVal), *nonceB64)
+	if err != nil {
+		if *jsonOutput {
+			protocol.ErrorResponse("SIGN_FAILED", fmt.Sprintf("TPM signing failed: %v", err))
+		} else {
+			protocol.HumanMessage("Error: TPM signing failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *jsonOutput {
+		protocol.SuccessResponse(result)
+	} else {
+		protocol.HumanMessage("Challenge signed successfully")
+		protocol.HumanMessage("  Algorithm:  %s", result.Algorithm)
+		protocol.HumanMessage("  AK Handle:  %s", result.AKHandle)
+		protocol.HumanMessage("  Signature:  %s... (%d chars)", result.SignatureBase64[:40], len(result.SignatureBase64))
+	}
+}
+
+// runSession starts an interactive session.
+//
+// Session mode keeps the TPM open and accepts multiple commands over a pipe
+// or stdin/stdout, requiring only ONE elevation (UAC/sudo) for the entire
+// enrollment flow instead of separate elevations for extract and activate.
+//
+// On Windows: uses a named pipe (passed via --pipe) because ShellExecuteEx
+// doesn't pass stdin/stdout to elevated processes.
+// On Linux/macOS: uses stdin/stdout (preserved by pkexec/sudo).
+func runSession(args []string) {
+	flags := flag.NewFlagSet("session", flag.ExitOnError)
+	wantElevation := flags.Bool("elevated", false, "trigger UAC/sudo")
+	pipeName := flags.String("pipe", "", "TCP address for session I/O (Windows)")
+	sessionToken := flags.String("session-token", "", "authentication token for session (required with --pipe)")
+	alreadyElevated := flags.Bool("_already-elevated", false, "internal: marks process as already elevated")
+	flags.Parse(args)
+
+	if *alreadyElevated {
+		*wantElevation = false
+	}
+
+	// Handle elevation
+	if *wantElevation && !elevate.IsRunningElevated() {
+		protocol.HumanMessage("Requesting administrator privileges...")
+		if err := elevate.RelaunchElevated(); err != nil {
+			protocol.ErrorResponse("UAC_DENIED", err.Error())
+		}
+		return
+	}
+
+	// SECURITY: Require session token when using TCP socket mode.
+	// The token prevents rogue local processes from connecting to the
+	// session socket and issuing TPM commands as admin.
+	if *pipeName != "" && *sessionToken == "" {
+		protocol.ErrorResponse("SESSION_ERROR", "--session-token is required when using --pipe")
+		return
+	}
+
+	// Determine I/O: TCP socket (Windows) or stdin/stdout (Linux/macOS)
+	var reader io.Reader
+	var writer io.Writer
+	var sessionCloser io.Closer
+
+	if *pipeName != "" {
+		// TCP loopback socket mode (Windows elevated processes can't use stdin/stdout).
+		// The parent process is listening on this address; we connect to it.
+		conn, err := net.Dial("tcp", *pipeName)
+		if err != nil {
+			protocol.ErrorResponse("SESSION_ERROR", fmt.Sprintf("Could not connect to session socket %s: %v", *pipeName, err))
+			return
+		}
+		sessionCloser = conn
+		defer conn.Close()
+		reader = conn
+		writer = conn
+	} else {
+		// stdin/stdout mode (Linux/macOS, or direct testing)
+		reader = os.Stdin
+		writer = os.Stdout
+	}
+	_ = sessionCloser // used only for cleanup
+
+	if err := session.RunSession(reader, writer, *sessionToken); err != nil {
+		protocol.HumanMessage("Session ended with error: %v", err)
 		os.Exit(1)
 	}
 }
